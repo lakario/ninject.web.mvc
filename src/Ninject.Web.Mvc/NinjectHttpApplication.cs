@@ -1,76 +1,134 @@
 using System;
-using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+using System.Web;
 using System.Web.Mvc;
 using System.Web.Routing;
-using Ninject.Planning.Bindings;
-using System.Linq;
+using Ninject.Infrastructure;
 
 namespace Ninject.Web.Mvc
 {
-    /// <summary>
-    /// A controller factory that creates <see cref="IController"/>s via Ninject.
-    /// </summary>
-    public class NinjectControllerFactory : DefaultControllerFactory
-    {
-        /// <summary>
-        /// Gets the kernel that will be used to create controllers.
-        /// </summary>
-        public IKernel Kernel { get; private set; }
+	/// <summary>
+	/// Defines an <see cref="HttpApplication"/> that is controlled by a Ninject <see cref="IKernel"/>.
+	/// </summary>
+	public abstract class NinjectHttpApplication : HttpApplication, IHaveKernel
+	{
+		private static IKernel _kernel;
 
-        /// <summary>
-        /// Initializes a new instance of the <see cref="NinjectControllerFactory"/> class.
-        /// </summary>
-        /// <param name="kernel">The kernel that should be used to create controllers.</param>
-        public NinjectControllerFactory(IKernel kernel)
-        {
-            Kernel = kernel;
-        }
+		/// <summary>
+		/// Gets the kernel.
+		/// </summary>
+		public IKernel Kernel
+		{
+			get { return _kernel; }
+		}
 
-        /// <summary>
-        /// Creates the controller with the specified name.
-        /// </summary>
-        /// <param name="requestContext">The request context.</param>
-        /// <param name="controllerName">Name of the controller.</param>
-        /// <returns>The created controller.</returns>
-        public override IController CreateController(RequestContext requestContext, string controllerName)
-        {
-            IController controller = null;
+		/// <summary>
+		/// Starts the application.
+		/// </summary>
+		public void Application_Start()
+		{
+			lock (this)
+			{
+				_kernel = CreateKernel();
 
-            // if the route provides a namespace resolve the controller by controllerName and namespace
-            object routeNamespacesObj;
-            if (requestContext != null && requestContext.RouteData.DataTokens.TryGetValue("Namespaces", out routeNamespacesObj))
-            {
-                IEnumerable<string> routeNamespaces = routeNamespacesObj as IEnumerable<string>;
-                if (routeNamespaces != null && routeNamespaces.Any())
-                    controller = Kernel.TryGet<IController>(ctx => ctx.Name == controllerName.ToLowerInvariant() && IsControllerInNamespace(ctx, routeNamespaces.FirstOrDefault()));
-            }
+				_kernel.Bind<RouteCollection>().ToConstant(RouteTable.Routes);
+				_kernel.Bind<HttpContext>().ToMethod(ctx => HttpContext.Current).InRequestScope();
+				_kernel.Bind<HttpContextBase>().ToMethod(ctx => new HttpContextWrapper(HttpContext.Current)).InRequestScope();
+				
+				ControllerBuilder.Current.SetControllerFactory(new NinjectControllerFactory(_kernel));
 
-            // otherwise use the controllerName to resolve
-            if (controller == null)
-                controller = Kernel.TryGet<IController>(controllerName.ToLowerInvariant());
+				_kernel.Inject(this);
 
-            if (controller == null)
-                return base.CreateController(requestContext, controllerName);
+				OnApplicationStarted();
+			}
+		}
 
-            var standardController = controller as Controller;
+		/// <summary>
+		/// Stops the application.
+		/// </summary>
+		public void Application_Stop()
+		{
+			lock (this)
+			{
+				if (_kernel != null)
+				{
+					_kernel.Dispose();
+					_kernel = null;
+				}
 
-            if (standardController != null)
-                standardController.ActionInvoker = new NinjectActionInvoker(Kernel);
+				OnApplicationStopped();
+			}
+		}
 
-            return controller;
-        }
+		/// <summary>
+		/// Registers all controllers in the assembly with the specified name.
+		/// </summary>
+		/// <param name="assemblyName">Name of the assembly to search for controllers.</param>
+		public void RegisterAllControllersIn(string assemblyName)
+		{
+			RegisterAllControllersIn(Assembly.Load(assemblyName), GetControllerName);
+		}
 
-        /// <summary>
-        /// Releases the specified controller.
-        /// </summary>
-        /// <param name="controller">The controller to release.</param>
-        public override void ReleaseController(IController controller) { }
+		/// <summary>
+		/// Registers all controllers in the assembly with the specified name.
+		/// </summary>
+		/// <param name="assemblyName">Name of the assembly to search for controllers.</param>
+		/// <param name="namingConvention">The naming convention to use for the controllers.</param>
+		public void RegisterAllControllersIn(string assemblyName, Func<Type, string> namingConvention)
+		{
+			RegisterAllControllersIn(Assembly.Load(assemblyName), namingConvention);
+		}
 
-        private static bool IsControllerInNamespace(IBindingMetadata binding, string @namespace)
-        {
-            if (binding != null && !string.IsNullOrEmpty(@namespace) && binding.Has("Namespace"))
-                return binding.Get<string>("Namespace").ToLowerInvariant() == @namespace.ToLowerInvariant();
-            return false;
-        }
-    }
+		/// <summary>
+		/// Registers all controllers in the specified assembly.
+		/// </summary>
+		/// <param name="assembly">The assembly to search for controllers.</param>
+		public void RegisterAllControllersIn(Assembly assembly)
+		{
+			RegisterAllControllersIn(assembly, GetControllerName);
+		}
+
+		/// <summary>
+		/// Registers all controllers in the specified assembly.
+		/// </summary>
+		/// <param name="assembly">The assembly to search for controllers.</param>
+		/// <param name="namingConvention">The naming convention to use for the controllers.</param>
+		public void RegisterAllControllersIn(Assembly assembly, Func<Type, string> namingConvention)
+		{
+			foreach (Type type in assembly.GetExportedTypes().Where(IsController))
+				_kernel.Bind<IController>().To(type).InTransientScope().Named(namingConvention(type)).WithMetadata("Namespace", type.Namespace);
+		}
+
+		private static bool IsController(Type type)
+		{
+			return typeof(IController).IsAssignableFrom(type) && type.IsPublic && !type.IsAbstract && !type.IsInterface;
+		}
+
+		private static string GetControllerName(Type type)
+		{
+			string name = type.Name.ToLowerInvariant();
+
+			if (name.EndsWith("controller"))
+				name = name.Substring(0, name.IndexOf("controller"));
+
+			return name;
+		}
+
+		/// <summary>
+		/// Creates the kernel that will manage your application.
+		/// </summary>
+		/// <returns>The created kernel.</returns>
+		protected abstract IKernel CreateKernel();
+
+		/// <summary>
+		/// Called when the application is started.
+		/// </summary>
+		protected virtual void OnApplicationStarted() { }
+
+		/// <summary>
+		/// Called when the application is stopped.
+		/// </summary>
+		protected virtual void OnApplicationStopped() { }
+	}
 }
